@@ -7,6 +7,7 @@ import (
 
 func NewConn(conn *net.UDPConn, rudp *Rudp) *RudpConn {
 	con := &RudpConn{conn: conn, rudp: rudp,
+		die: make(chan struct{}),
 		recvChan: make(chan []byte, 1<<16), recvErr: make(chan error, 2),
 		sendChan: make(chan []byte, 1<<16), sendErr: make(chan error, 2),
 		SendTick: make(chan int, 2),
@@ -16,9 +17,11 @@ func NewConn(conn *net.UDPConn, rudp *Rudp) *RudpConn {
 }
 
 func NewUnConn(conn *net.UDPConn, remoteAddr *net.UDPAddr, rudp *Rudp, close func(string)) *RudpConn {
-	con := &RudpConn{conn: conn, rudp: rudp, SendTick: make(chan int, 2),
+	con := &RudpConn{conn: conn, rudp: rudp,
+		die: make(chan struct{}),
 		recvChan: make(chan []byte, 1<<16), recvErr: make(chan error, 2),
 		sendChan: make(chan []byte, 1<<16), sendErr: make(chan error, 2),
+		SendTick: make(chan int, 2),
 		closef: close, remoteAddr: remoteAddr, in: make(chan []byte, 1<<16),
 	}
 	go con.run()
@@ -29,6 +32,8 @@ type RudpConn struct {
 	conn *net.UDPConn
 
 	rudp *Rudp
+
+	die      chan struct{} // disconnect
 
 	recvChan chan []byte
 	recvErr  chan error
@@ -56,6 +61,13 @@ func (rc *RudpConn) RemoteAddr() net.Addr {
 	return rc.conn.RemoteAddr()
 }
 func (rc *RudpConn) Close() error {
+	select {
+	case <-rc.die:
+		return nil
+	default:
+		close(rc.die)
+	}
+
 	var err error
 	if rc.remoteAddr != nil {
 		if rc.closef != nil {
@@ -143,6 +155,8 @@ func (rc *RudpConn) sendLoop() {
 	var sendNum int
 	for {
 		select {
+		case <-rc.die: // connect close
+			return
 		case tick := <-rc.SendTick:
 		sendOut:
 			for {
@@ -189,10 +203,14 @@ func (rc *RudpConn) sendLoop() {
 func (rc *RudpConn) run() {
 	if autoSend && sendTick > 0 {
 		go func() {
-			tick := time.Tick(sendTick)
+			ticker := time.NewTicker(sendTick)
+			defer ticker.Stop()
+
 			for {
 				select {
-				case <-tick:
+				case <-rc.die: // connect close
+					return
+				case <-ticker.C:
 					rc.SendTick <- 1
 				}
 			}
